@@ -99,10 +99,10 @@ The **data pipeline**. Four separate workers run as containers:
 
 | Worker | Entry Point | Task Queue | Role |
 |--------|-------------|------------|------|
-| Main Worker | `src/run_worker.py` | `genesis-task-queue` | Runs Chronos, Genesis, Paging workflows |
-| Activity Worker | `src/run_activity_worker.py` | `activity-task-queue` | Runs email, calendar, agent, partition activities |
-| Memory Worker | `src/run_memory_activity_worker.py` | `memory-activity-task-queue` | Graph queries, memory storage |
-| Sync Worker | `src/run_sync_worker.py` | `sync-task-queue` | Billing sync, onboarding, Customer.io |
+| Main Worker | [`src/run_worker.py`](https://github.com/fambots/famworker/blob/main/src/run_worker.py) | `genesis-task-queue` | Runs Chronos, Genesis, Paging workflows |
+| Activity Worker | [`src/run_activity_worker.py`](https://github.com/fambots/famworker/blob/main/src/run_activity_worker.py) | `activity-task-queue` | Runs email, calendar, agent, partition activities |
+| Memory Worker | [`src/run_memory_activity_worker.py`](https://github.com/fambots/famworker/blob/main/src/run_memory_activity_worker.py) | `memory-activity-task-queue` | Graph queries, memory storage |
+| Sync Worker | [`src/run_sync_worker.py`](https://github.com/fambots/famworker/blob/main/src/run_sync_worker.py) | `sync-task-queue` | Billing sync, onboarding, Customer.io |
 
 ### Service B: Fambot FastAPI (`fambot/`)
 
@@ -118,7 +118,7 @@ Both services share the same `fambot/src/` Python code (models, GraphEngine, too
 
 ## 4. Step 1: Chronos — The Scheduler
 
-**File:** `src/workflows/chronos.py`
+**File:** [`src/workflows/chronos.py`](https://github.com/fambots/famworker/blob/main/src/workflows/chronos.py)
 
 Chronos is a Temporal scheduled workflow that runs **every 60 seconds**. Its job is simple: pick the next user who needs processing and start a Genesis workflow for them.
 
@@ -132,7 +132,7 @@ Every 60 seconds:
      → Start Genesis for that user. Done.
 ```
 
-This is configured as a Temporal Schedule in `run_worker.py`:
+This is configured as a Temporal Schedule in [`run_worker.py`](https://github.com/fambots/famworker/blob/main/src/run_worker.py):
 
 ```python
 await client.create_schedule(
@@ -151,7 +151,7 @@ await client.create_schedule(
 
 ## 5. Step 2: Genesis — The Per-User Orchestrator
 
-**File:** `src/workflows/genesis.py`
+**File:** [`src/workflows/genesis.py`](https://github.com/fambots/famworker/blob/main/src/workflows/genesis.py)
 
 Genesis is the per-user orchestrator. When Chronos picks a user, Genesis runs the full processing pipeline for that user.
 
@@ -181,7 +181,7 @@ Genesis(uid):
 
 ## 6. Step 3: Paging — The Data Processor
 
-**File:** `src/workflows/paging.py`
+**File:** [`src/workflows/paging.py`](https://github.com/fambots/famworker/blob/main/src/workflows/paging.py)
 
 Paging is where the actual work happens. Each PagingWorkflow handles one pathway (one node + one policy). There are three patterns:
 
@@ -278,7 +278,7 @@ Calendar events also feed into `root.google_events`, which is an "external entit
 
 ## 9. The Daily Digest
 
-**File:** `src/workflows/digest_scheduler.py`
+**File:** [`src/workflows/digest_scheduler.py`](https://github.com/fambots/famworker/blob/main/src/workflows/digest_scheduler.py)
 
 The DigestSchedulerWorkflow runs **every 15 minutes** and handles sending the daily digest email:
 
@@ -306,7 +306,7 @@ Teaser content is pre-computed during Genesis:
 
 ## 10. famgraph.json — The Central Configuration
 
-**File:** `fambot/src/memory/famgraph.json` (~9000 lines)
+**File:** [`fambot/src/memory/famgraph.json`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/famgraph.json) (~9000 lines)
 
 This is the single most important file in the repo. It defines three things:
 
@@ -450,7 +450,7 @@ root.family_activities → agent_activity → root.actor_roles
 
 ## 13. The Schema: Database Table Definitions
 
-The `schema` section of famgraph.json defines ~92 database tables. Tables use **inheritance** from four base schemas:
+The `schema` section of [`famgraph.json`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/famgraph.json) defines ~92 database tables. Tables use **inheritance** from four base schemas:
 
 ### Base Schemas
 
@@ -493,7 +493,7 @@ The `schema` section of famgraph.json defines ~92 database tables. Tables use **
 }
 ```
 
-The action table inherits ~30+ columns from its three bases, plus its own columns. The `_extends_from` mechanism is resolved by `schema_utils.extend_from_base()` at schema generation time.
+The action table inherits ~30+ columns from its three bases, plus its own columns. The `_extends_from` mechanism is resolved by [`schema_utils.extend_from_base()`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/schema_utils.py) at schema generation time.
 
 ### Schema → Database Flow
 
@@ -511,7 +511,7 @@ PostgreSQL tables
 
 ## 14. GraphEngine: Bridging Config to Live Data
 
-**File:** `fambot/src/memory/injected_models.py`
+**File:** [`fambot/src/memory/injected_models.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/injected_models.py)
 
 GraphEngine is the runtime class that brings famgraph.json to life. It's used by both the FastAPI service and Temporal workers.
 
@@ -557,7 +557,7 @@ return render_path(graph, "root.feed_v2")
 
 ## 15. The FastAPI Service and Chat
 
-**File:** `fambot/src/fam/fam_service.py`
+**File:** [`fambot/src/fam/fam_service.py`](https://github.com/fambots/famworker/blob/main/fambot/src/fam/fam_service.py)
 
 ### Key Endpoints
 
@@ -618,7 +618,7 @@ Both agents are LangGraph ReAct agents with different tool sets. They share the 
 
 ## 16. Profiles: Family Member Data
 
-**File:** `fambot/src/memory/profile.py`
+**File:** [`fambot/src/memory/profile.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/profile.py)
 
 Profiles organize information about family members in a hierarchical structure:
 
@@ -654,7 +654,7 @@ Profiles are used for:
 ### PostgreSQL (primary database)
 
 - ~92 tables defined in famgraph.json schema
-- Accessed via SQLAlchemy (`SQLEngine` in `fambot/src/db/sql/engine.py`)
+- Accessed via SQLAlchemy (`SQLEngine` in [`fambot/src/db/sql/engine.py`](https://github.com/fambots/famworker/blob/main/fambot/src/db/sql/engine.py))
 - Supports both sync (psycopg2) and async (asyncpg) access
 - Separate read replica for query-heavy workloads
 
@@ -663,7 +663,7 @@ Profiles are used for:
 - **Data transfer:** Temporal workflows pass large data between PagingWorkflows via Redis keys (data is too large for Temporal's payload limits)
 - **Query cache:** `cache_redis` decorator for function-level caching (default TTL: 15 min)
 - **GraphEngine:** Uses Redis for query result caching
-- Client: `RedisClient` in `fambot/src/fam/messages/redis_client.py`
+- Client: `RedisClient` in [`fambot/src/fam/messages/redis_client.py`](https://github.com/fambots/famworker/blob/main/fambot/src/fam/messages/redis_client.py)
 
 ### ClickHouse (observability/analytics)
 
@@ -718,60 +718,60 @@ There is no per-node budget for the pipeline yet (this is what the Node Budget C
 
 | File | Purpose |
 |------|---------|
-| `src/workflows/chronos.py` | Scheduler — picks users for processing |
-| `src/workflows/genesis.py` | Per-user orchestrator — runs pathways in phases |
-| `src/workflows/paging.py` | Data processor — runs one pathway per workflow |
-| `src/workflows/digest_scheduler.py` | Sends daily digest emails |
-| `src/activities/email.py` | Fetches emails from Gmail |
-| `src/activities/calendar.py` | Fetches events from Google Calendar |
-| `src/activities/agent.py` | Runs LLM extraction (agent_activity) |
-| `src/activities/genesis.py` | Genesis helper activities |
-| `src/activities/partition.py` | Data partitioning for batch processing |
-| `src/activities/billing_sync.py` | Cost attribution to ClickHouse |
-| `src/run_worker.py` | Main worker entry — registers workflows and schedules |
+| [`src/workflows/chronos.py`](https://github.com/fambots/famworker/blob/main/src/workflows/chronos.py) | Scheduler — picks users for processing |
+| [`src/workflows/genesis.py`](https://github.com/fambots/famworker/blob/main/src/workflows/genesis.py) | Per-user orchestrator — runs pathways in phases |
+| [`src/workflows/paging.py`](https://github.com/fambots/famworker/blob/main/src/workflows/paging.py) | Data processor — runs one pathway per workflow |
+| [`src/workflows/digest_scheduler.py`](https://github.com/fambots/famworker/blob/main/src/workflows/digest_scheduler.py) | Sends daily digest emails |
+| [`src/activities/email.py`](https://github.com/fambots/famworker/blob/main/src/activities/email.py) | Fetches emails from Gmail |
+| [`src/activities/calendar.py`](https://github.com/fambots/famworker/blob/main/src/activities/calendar.py) | Fetches events from Google Calendar |
+| [`src/activities/agent.py`](https://github.com/fambots/famworker/blob/main/src/activities/agent.py) | Runs LLM extraction (agent_activity) |
+| [`src/activities/genesis.py`](https://github.com/fambots/famworker/blob/main/src/activities/genesis.py) | Genesis helper activities |
+| [`src/activities/partition.py`](https://github.com/fambots/famworker/blob/main/src/activities/partition.py) | Data partitioning for batch processing |
+| [`src/activities/billing_sync.py`](https://github.com/fambots/famworker/blob/main/src/activities/billing_sync.py) | Cost attribution to ClickHouse |
+| [`src/run_worker.py`](https://github.com/fambots/famworker/blob/main/src/run_worker.py) | Main worker entry — registers workflows and schedules |
 
 ### Configuration and Models
 
 | File | Purpose |
 |------|---------|
-| `fambot/src/memory/famgraph.json` | Central config: graph nodes, schema, logging |
-| `fambot/src/memory/models.py` | Node, Entity, Graph, EntityNode classes |
-| `fambot/src/memory/policy.py` | Policy, Pathway, GroundFlow, RecurringTraits |
-| `fambot/src/memory/injected_models.py` | GraphEngine — runtime bridge between config and data |
-| `fambot/src/memory/profile.py` | Profile resolution and hierarchy |
-| `fambot/src/memory/schema_utils.py` | Schema inheritance resolution |
-| `fambot/src/memory/composition.py` | Data composition and merging |
+| [`fambot/src/memory/famgraph.json`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/famgraph.json) | Central config: graph nodes, schema, logging |
+| [`fambot/src/memory/models.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/models.py) | Node, Entity, Graph, EntityNode classes |
+| [`fambot/src/memory/policy.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/policy.py) | Policy, Pathway, GroundFlow, RecurringTraits |
+| [`fambot/src/memory/injected_models.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/injected_models.py) | GraphEngine — runtime bridge between config and data |
+| [`fambot/src/memory/profile.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/profile.py) | Profile resolution and hierarchy |
+| [`fambot/src/memory/schema_utils.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/schema_utils.py) | Schema inheritance resolution |
+| [`fambot/src/memory/composition.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/composition.py) | Data composition and merging |
 
 ### API and Chat
 
 | File | Purpose |
 |------|---------|
-| `fambot/src/fam/fam_service.py` | FastAPI routes (large file — most endpoints) |
-| `fambot/src/graph/chat_graph.py` | Chat LangGraph agent definition |
-| `fambot/src/graph/chat_system_prompt.py` | Chat system prompt builder |
-| `fambot/src/fam/fam_tools/chat/` | Chat tool implementations |
-| `fambot/src/react_agent/tools.py` | Cleo (Temporal) agent tools |
-| `fambot/src/agents/agents.py` | Agent registry |
+| [`fambot/src/fam/fam_service.py`](https://github.com/fambots/famworker/blob/main/fambot/src/fam/fam_service.py) | FastAPI routes (large file — most endpoints) |
+| [`fambot/src/graph/chat_graph.py`](https://github.com/fambots/famworker/blob/main/fambot/src/graph/chat_graph.py) | Chat LangGraph agent definition |
+| [`fambot/src/graph/chat_system_prompt.py`](https://github.com/fambots/famworker/blob/main/fambot/src/graph/chat_system_prompt.py) | Chat system prompt builder |
+| [`fambot/src/fam/fam_tools/chat/`](https://github.com/fambots/famworker/tree/main/fambot/src/fam/fam_tools/chat) | Chat tool implementations |
+| [`fambot/src/react_agent/tools.py`](https://github.com/fambots/famworker/blob/main/fambot/src/react_agent/tools.py) | Cleo (Temporal) agent tools |
+| [`fambot/src/agents/agents.py`](https://github.com/fambots/famworker/blob/main/fambot/src/agents/agents.py) | Agent registry |
 
 ### Database
 
 | File | Purpose |
 |------|---------|
-| `fambot/src/db/sql/engine.py` | SQLEngine — database access layer |
-| `fambot/src/db/sql/generated_schema.py` | Auto-generated ORM (do NOT edit) |
-| `fambot/src/db/sql/sync_spec_to_db.py` | Generates schema from famgraph.json |
-| `fambot/src/db/sql/sync_famgraphs.py` | Syncs famgraph specs to DB |
-| `fambot/src/db/sql/alembic/` | Database migrations |
+| [`fambot/src/db/sql/engine.py`](https://github.com/fambots/famworker/blob/main/fambot/src/db/sql/engine.py) | SQLEngine — database access layer |
+| [`fambot/src/db/sql/generated_schema.py`](https://github.com/fambots/famworker/blob/main/fambot/src/db/sql/generated_schema.py) | Auto-generated ORM (do NOT edit) |
+| [`fambot/src/db/sql/sync_spec_to_db.py`](https://github.com/fambots/famworker/blob/main/fambot/src/db/sql/sync_spec_to_db.py) | Generates schema from famgraph.json |
+| [`fambot/src/db/sql/sync_famgraphs.py`](https://github.com/fambots/famworker/blob/main/fambot/src/db/sql/sync_famgraphs.py) | Syncs famgraph specs to DB |
+| [`fambot/src/db/sql/alembic/`](https://github.com/fambots/famworker/tree/main/fambot/src/db/sql/alembic) | Database migrations |
 
 ### Observability
 
 | File | Purpose |
 |------|---------|
-| `fambot/src/fam/observability/config.py` | Observability configuration |
-| `fambot/src/fam/observability/pricing.py` | LLM cost calculation |
-| `fambot/src/fam/observability/llm.py` | ClickHouse logging callback |
-| `fambot/src/fam/observability/clickhouse_client.py` | ClickHouse HTTP client |
-| `fambot/src/fam/observability/clickhouse/dashboards/` | Grafana dashboard definitions |
+| [`fambot/src/fam/observability/config.py`](https://github.com/fambots/famworker/blob/main/fambot/src/fam/observability/config.py) | Observability configuration |
+| [`fambot/src/fam/observability/pricing.py`](https://github.com/fambots/famworker/blob/main/fambot/src/fam/observability/pricing.py) | LLM cost calculation |
+| [`fambot/src/fam/observability/llm.py`](https://github.com/fambots/famworker/blob/main/fambot/src/fam/observability/llm.py) | ClickHouse logging callback |
+| [`fambot/src/fam/observability/clickhouse_client.py`](https://github.com/fambots/famworker/blob/main/fambot/src/fam/observability/clickhouse_client.py) | ClickHouse HTTP client |
+| [`fambot/src/fam/observability/clickhouse/dashboards/`](https://github.com/fambots/famworker/tree/main/fambot/src/fam/observability/clickhouse/dashboards) | Grafana dashboard definitions |
 
 ---
 
