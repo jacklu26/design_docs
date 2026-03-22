@@ -6,6 +6,7 @@ A step-by-step walkthrough of the famworker codebase — what it does, how data 
 
 ## Table of Contents
 
+- [Key Concepts at a Glance](#key-concepts-at-a-glance)
 1. [What Is Fambot?](#1-what-is-fambot)
 2. [Repository Layout](#2-repository-layout)
 3. [The Two Main Services](#3-the-two-main-services)
@@ -24,6 +25,96 @@ A step-by-step walkthrough of the famworker codebase — what it does, how data 
 16. [Storage: Postgres, Redis, ClickHouse](#16-storage-postgres-redis-clickhouse)
 17. [Cost Tracking and Observability](#17-cost-tracking-and-observability)
 18. [Key File Reference](#18-key-file-reference)
+
+---
+
+## Key Concepts at a Glance
+
+Before diving into the full guide, here are the core abstractions you'll encounter everywhere in the codebase. Understanding these up front will make the rest of the guide (and your code reviews) much easier to follow.
+
+### famgraph.json — The Single Source of Truth
+
+`fambot/src/memory/famgraph.json` (~9,000 lines) is the declarative specification for the entire system. It defines the graph of data nodes, the processing policies that populate them, the database schema for ~92 tables, and the LLM pricing config. Nearly every runtime behavior — what data gets fetched, how it's transformed, where it's stored, and how it's served to the frontend — is driven by this one file. If you only look at one file, make it this one.
+
+### Node — A Data Category in the Graph
+
+A **Node** is a named location in a tree hierarchy, referenced by a dot-separated path like `root.emails` or `root.family.children`. Each node typically maps to a database table (its "entity"), and can carry policies (processing pipelines), filters, sorters, and a row limit. Nodes are the fundamental unit of data organization: the API serves data by node path (`GET /fam/root.feed_v2`), and the processing pipeline targets data into specific nodes.
+
+**Defined in:** `fambot/src/memory/models.py` — `Node` class
+
+### Entity — A Database Table
+
+An **Entity** is the schema definition for a Postgres table (e.g. `email`, `action`, `event`, `subscriber`). Entities are declared in the `schema` section of famgraph.json and inherit columns from base schemas (`system_base`, `gist_base`, `entity_base`, `belief`). The file `sync_spec_to_db.py` auto-generates the SQLAlchemy ORM (`generated_schema.py`) from these definitions — you never edit the ORM by hand.
+
+**Defined in:** `fambot/src/memory/models.py` — `Entity` class; schema in `famgraph.json`
+
+### Policy — A Declarative Processing Rule
+
+A **Policy** is a JSON block attached to a node that declares *how* data flows into it: which source nodes to read from, which activity to run (e.g. `agent_activity`, `calendar_activity`), which fields to extract, which LLM model to use, and the batch size. Policies are the static, config-time description of a pipeline step. Set `"active": false` to disable one without removing it.
+
+**Defined in:** `fambot/src/memory/policy.py` — `Policy` class
+
+### Pathway — The Runtime Pipeline Unit
+
+A **Pathway** is the runtime representation of a policy. When Genesis starts processing a user, `famspec_activity` reads famgraph.json, resolves all active policies, and converts each one into a Pathway dataclass with everything needed for execution: source data key, target node, activity name, LLM model, batch size, field list, filters, and more. Each PagingWorkflow executes exactly one Pathway.
+
+**Defined in:** `fambot/src/memory/policy.py` — `Pathway` class
+
+### GroundFlow — The Core Triple
+
+A **GroundFlow** is the innermost building block of a policy: the combination of a **flow** (which activity to run), a **source** (which node to read from), and the **fields** to extract. A single policy with multiple sources or flows produces multiple GroundFlows, each of which becomes its own Pathway.
+
+**Defined in:** `fambot/src/memory/policy.py` — `GroundFlow` class
+
+### GraphEngine — Config Meets Live Data
+
+**GraphEngine** is the runtime class that loads famgraph.json (or a per-user override from the DB), parses it into a `Graph` of `Node` objects, and provides the methods everyone else calls: `get_pathways()` for Temporal workers, `get_node()` / `render_path()` for the API, and `get_path_data()` for database queries with filters and sorters. It uses LRU caches (50 instances, 200 query results) so it isn't re-parsed on every request.
+
+**Defined in:** `fambot/src/memory/injected_models.py` — `GraphEngine` class
+
+### Chronos, Genesis, Paging — The Workflow Triad
+
+These three Temporal workflows form the heart of the data pipeline:
+
+| Workflow | Role | Cadence |
+|----------|------|---------|
+| **Chronos** | Scheduler — picks which user to process next | Every 60 seconds |
+| **Genesis** | Per-user orchestrator — builds pathways and runs them in phased order | On demand (started by Chronos) |
+| **Paging** | Data processor — executes one pathway (fetch, partition, LLM extract, store) | On demand (started by Genesis) |
+
+Chronos decides *who*, Genesis decides *what order*, and Paging does *the actual work*. Data flows between PagingWorkflows via Redis keys (too large for Temporal payloads).
+
+**Defined in:** `src/workflows/chronos.py`, `src/workflows/genesis.py`, `src/workflows/paging.py`
+
+### View Node — Frontend Aggregation
+
+A **View Node** doesn't store its own data. Instead, it references other entity nodes via a `paths` dictionary, each with optional filter and sorter overrides. The primary example is `root.feed_v2`, which pulls data from `root.actions`, `root.family_events`, `root.backpack_items`, `root.insights`, and `root.events` into one combined response for the frontend.
+
+### Proto Entity — Draft Before Final
+
+Many pipelines use a two-pass extraction pattern: the LLM first produces **proto** (draft) records (`root.proto_actions`, `root.proto_events`, etc.), then a second LLM pass refines, deduplicates, and enriches them into final entities (`root.actions`, `root.family_events`). This staged approach improves extraction quality.
+
+### Gist — Semantic Search and Deduplication
+
+A **Gist** is a short text summary of a record plus its vector embedding. Tables that inherit from `gist_base` get `gist`, `gist_embedding`, and `gist_model` columns. Gists power semantic search (finding similar records by meaning) and exclusion-based deduplication (avoiding duplicate extractions across scans).
+
+**Defined in:** `fambot/src/memory/gist_models.py`, inherited via `gist_base` in the schema
+
+### Profiles — Structured Family Data
+
+**Profiles** organize information about family members (children, adults, caregivers) in a hierarchical structure: `school.identity`, `school.schedule`, `activity.gear`, etc. Profile facts are stored as `fam_profile` records and are used to build rich LLM context, personalize chat, compute the Profile Completeness Score (PCS), and generate the daily digest.
+
+**Defined in:** `fambot/src/memory/profile.py`
+
+### DDIS and PCS — Digest Eligibility Scores
+
+Two scores gate whether a user receives a daily digest email. **DDIS** (Daily Digest Interest Score, threshold >= 40) measures whether enough *new data* has arrived since the last digest. **PCS** (Profile Completeness Score, threshold >= 80) measures whether the user's profile is rich enough to produce a personalized, useful digest. Both must be met.
+
+### Activity — A Temporal Unit of Work
+
+An **Activity** is a single function executed by a Temporal worker (e.g. `email_activity` fetches Gmail, `agent_activity` runs an LLM extraction, `partition_activity` splits data into batches). Activities are routed to specific task queues (`activity-task-queue`, `memory-activity-task-queue`, etc.) via the `ActivityMetadataLoader` and task queue router.
+
+**Defined in:** `src/activities/` directory
 
 ---
 
