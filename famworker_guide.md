@@ -188,6 +188,8 @@ Once Genesis completes, the user's data is in Postgres. The frontend calls `GET 
 
 From now on, Chronos will periodically rescan this user (based on `last_scan` age). The DigestSchedulerWorkflow will start sending daily digest emails once the user's DDIS and PCS scores are high enough.
 
+> **NOTE:** DDIS (Daily Digest Interest Score) measures whether there's enough *new data* since the last digest to make it worthwhile (threshold: >= 40). PCS (Profile Completeness Score) measures whether the user's profile is rich enough — children, schools, activities, etc. — to produce a useful, personalized digest (threshold: >= 80). Both must be met before the first digest is sent.
+
 ### Summary Timeline
 
 ```
