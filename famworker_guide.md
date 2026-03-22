@@ -9,22 +9,21 @@ A step-by-step walkthrough of the famworker codebase — what it does, how data 
 1. [What Is Fambot?](#1-what-is-fambot)
 2. [Repository Layout](#2-repository-layout)
 3. [The Two Main Services](#3-the-two-main-services)
-4. [Step 1: Chronos — The Scheduler](#4-step-1-chronos--the-scheduler)
-5. [Step 2: Genesis — The Per-User Orchestrator](#5-step-2-genesis--the-per-user-orchestrator)
-6. [Step 3: Paging — The Data Processor](#6-step-3-paging--the-data-processor)
-7. [The Full Email Pipeline](#7-the-full-email-pipeline)
-8. [The Calendar Pipeline](#8-the-calendar-pipeline)
-9. [The Daily Digest](#9-the-daily-digest)
-10. [famgraph.json — The Central Configuration](#10-famgraphjson--the-central-configuration)
-11. [Nodes: The Building Blocks](#11-nodes-the-building-blocks)
-12. [Policies and Pathways: How Data Flows Between Nodes](#12-policies-and-pathways-how-data-flows-between-nodes)
-13. [The Schema: Database Table Definitions](#13-the-schema-database-table-definitions)
-14. [GraphEngine: Bridging Config to Live Data](#14-graphengine-bridging-config-to-live-data)
-15. [The FastAPI Service and Chat](#15-the-fastapi-service-and-chat)
-16. [Profiles: Family Member Data](#16-profiles-family-member-data)
-17. [Storage: Postgres, Redis, ClickHouse](#17-storage-postgres-redis-clickhouse)
-18. [Cost Tracking and Observability](#18-cost-tracking-and-observability)
-19. [Key File Reference](#19-key-file-reference)
+4. [Walkthrough: What Happens When a New User Joins](#4-walkthrough-what-happens-when-a-new-user-joins)
+5. [The Workflow Chain: Chronos, Genesis, Paging](#5-the-workflow-chain-chronos-genesis-paging)
+6. [The Full Email Pipeline](#6-the-full-email-pipeline)
+7. [The Calendar Pipeline](#7-the-calendar-pipeline)
+8. [The Daily Digest](#8-the-daily-digest)
+9. [Deep Dive: famgraph.json](#9-deep-dive-famgraphjson)
+10. [The Graph: Root, Nodes, and Paths](#10-the-graph-root-nodes-and-paths)
+11. [Policies and Pathways: How Data Flows Between Nodes](#11-policies-and-pathways-how-data-flows-between-nodes)
+12. [The Schema: Database Table Definitions](#12-the-schema-database-table-definitions)
+13. [GraphEngine: Bridging Config to Live Data](#13-graphengine-bridging-config-to-live-data)
+14. [The FastAPI Service and Chat](#14-the-fastapi-service-and-chat)
+15. [Profiles: Family Member Data](#15-profiles-family-member-data)
+16. [Storage: Postgres, Redis, ClickHouse](#16-storage-postgres-redis-clickhouse)
+17. [Cost Tracking and Observability](#17-cost-tracking-and-observability)
+18. [Key File Reference](#18-key-file-reference)
 
 ---
 
@@ -116,9 +115,110 @@ Both services share the same `fambot/src/` Python code (models, GraphEngine, too
 
 ---
 
-## 4. Step 1: Chronos — The Scheduler
+## 4. Walkthrough: What Happens When a New User Joins
 
-**File:** [`src/workflows/chronos.py`](https://github.com/fambots/famworker/blob/main/src/workflows/chronos.py)
+Before diving into architecture, let's trace the full journey from signup to seeing data. This makes everything else concrete.
+
+### Step 1: Signup (Firebase)
+
+A user signs up with email and password. Firebase creates an account and sends a verification email.
+
+**Where:** `fambot/src/auth/utils.py` — `create_user_with_email_and_password()`
+
+### Step 2: Onboarding (Subscriber Creation)
+
+The frontend walks the user through onboarding steps: identity, location, coparent, children. Each step POSTs data to `POST /fam/root.subscribers`, which creates a `subscriber` record in Postgres with the user's Firebase `uid`.
+
+**Where:** `fambot/src/fam/fam_service.py` — the `/fam/{path}` POST handler
+
+### Step 3: Connect Google (OAuth)
+
+The user clicks "Connect Google" and goes through the OAuth consent screen. After approval:
+
+1. The callback receives an auth code and exchanges it for tokens
+2. A new row is created in the `integration` table: `uid`, `email`, `token`, `active=true`, `last_scan=NULL`
+3. The `subscriber` is updated: `connected=true`
+
+**Where:** `fambot/src/fam/fam_service.py` — `/oauth`, `/oauth_ios`, `/oauth/callback` endpoints
+
+The `last_scan=NULL` is the key detail — it's how the system knows this is a brand-new user.
+
+### Step 4: Chronos Picks Up the New User (~60 seconds)
+
+Chronos runs every 60 seconds. Its first action every tick is:
+
+```
+"Is there an integration with last_scan=NULL and subscriber.connected=true?"
+```
+
+The SQL is:
+
+```sql
+SELECT uid FROM integration
+WHERE active AND last_scan IS NULL
+  AND uid NOT IN (SELECT uid FROM subscriber WHERE NOT connected)
+ORDER BY total_scans ASC, last_scan ASC NULLS FIRST
+LIMIT 1;
+```
+
+New users (first scan) always get priority over rescans, and they skip the concurrency limit (max 2 concurrent Genesis workflows).
+
+**Where:** `src/workflows/chronos.py`, `fambot/src/db/sql/engine.py` — `get_integration_with_greatest_past_due_scan()`
+
+### Step 5: Genesis Processes the User
+
+Chronos starts a GenesisWorkflow for this `uid`. Genesis:
+
+1. Calls `famspec_activity(uid)` to load all pathways from famgraph.json
+2. Runs Phase 0 (external): Fetches emails from Gmail and events from Google Calendar
+3. Runs Phase 1+ (internal): LLM extracts actions, events, contacts, insights, backpack items
+4. All results are stored in Postgres
+
+### Step 6: Data Appears
+
+Once Genesis completes, the user's data is in Postgres. The frontend calls `GET /fam/root.feed_v2` and sees:
+
+- **Actions to Take** — from `root.actions`
+- **Key Dates to Add** — from `root.family_events`
+- **Good to Know** — from `root.insights`
+- **Backpack Check** — from `root.backpack_items`
+- **Schedule** — from `root.events`
+
+### Step 7: Ongoing Processing
+
+From now on, Chronos will periodically rescan this user (based on `last_scan` age). The DigestSchedulerWorkflow will start sending daily digest emails once the user's DDIS and PCS scores are high enough.
+
+### Summary Timeline
+
+```
+User signup (Firebase)
+  ↓ seconds
+Onboarding steps (subscriber created)
+  ↓ minutes
+Connect Google (OAuth → integration with last_scan=NULL)
+  ↓ ~60 seconds
+Chronos picks up new user
+  ↓ immediately
+Genesis starts (famspec → pathways → PagingWorkflows)
+  ↓ 2-10 minutes
+Phase 0: Gmail + Calendar fetched
+  ↓
+Phase 1+: LLM extraction (emails → actions, events, insights, etc.)
+  ↓
+Data appears in UI
+  ↓ next morning
+First daily digest email (if scores are high enough)
+```
+
+---
+
+## 5. The Workflow Chain: Chronos, Genesis, Paging
+
+Now that you've seen the user journey, let's look at the three workflows in detail.
+
+### Chronos — The Scheduler
+
+**File:** `src/workflows/chronos.py`
 
 Chronos is a Temporal scheduled workflow that runs **every 60 seconds**. Its job is simple: pick the next user who needs processing and start a Genesis workflow for them.
 
@@ -132,7 +232,7 @@ Every 60 seconds:
      → Start Genesis for that user. Done.
 ```
 
-This is configured as a Temporal Schedule in [`run_worker.py`](https://github.com/fambots/famworker/blob/main/src/run_worker.py):
+This is configured as a Temporal Schedule in `run_worker.py`:
 
 ```python
 await client.create_schedule(
@@ -145,13 +245,11 @@ await client.create_schedule(
 )
 ```
 
-**Key concept:** Chronos does NOT process data itself. It only decides WHO gets processed next.
+**Key concept:** Chronos does NOT process data itself. It only decides WHO gets processed next. The name is a reference to the Greek god of time (it's not an external framework — just a custom Temporal workflow in this repo).
 
----
+### Genesis — The Per-User Orchestrator
 
-## 5. Step 2: Genesis — The Per-User Orchestrator
-
-**File:** [`src/workflows/genesis.py`](https://github.com/fambots/famworker/blob/main/src/workflows/genesis.py)
+**File:** `src/workflows/genesis.py`
 
 Genesis is the per-user orchestrator. When Chronos picks a user, Genesis runs the full processing pipeline for that user.
 
@@ -177,15 +275,13 @@ Genesis(uid):
 
 **Key concept:** Genesis doesn't do the actual data processing either. It orchestrates the order in which PagingWorkflows run, respecting data dependencies between nodes.
 
----
+### Paging — The Data Processor
 
-## 6. Step 3: Paging — The Data Processor
-
-**File:** [`src/workflows/paging.py`](https://github.com/fambots/famworker/blob/main/src/workflows/paging.py)
+**File:** `src/workflows/paging.py`
 
 Paging is where the actual work happens. Each PagingWorkflow handles one pathway (one node + one policy). There are three patterns:
 
-### Pattern A: External Source (Gmail, Calendar)
+**Pattern A: External Source (Gmail, Calendar)**
 
 ```
 PagingWorkflow(root.emails):
@@ -194,7 +290,7 @@ PagingWorkflow(root.emails):
   3. Signal downstream PagingWorkflows with the Redis key
 ```
 
-### Pattern B: On-Start (initialization)
+**Pattern B: On-Start (initialization)**
 
 ```
 PagingWorkflow(on_start):
@@ -202,7 +298,7 @@ PagingWorkflow(on_start):
   2. Signal Genesis: "I'm done"
 ```
 
-### Pattern C: Internal Source (node-to-node processing)
+**Pattern C: Internal Source (node-to-node processing)**
 
 ```
 PagingWorkflow(root.family_emails):
@@ -218,7 +314,7 @@ PagingWorkflow(root.family_emails):
 
 ---
 
-## 7. The Full Email Pipeline
+## 6. The Full Email Pipeline
 
 This is the most important data flow. Follow it step by step:
 
@@ -257,7 +353,7 @@ Each arrow is a PagingWorkflow running agent_activity (an LLM call). The "proto"
 
 ---
 
-## 8. The Calendar Pipeline
+## 7. The Calendar Pipeline
 
 Simpler than email — calendar events are already structured:
 
@@ -276,7 +372,7 @@ Calendar events also feed into `root.google_events`, which is an "external entit
 
 ---
 
-## 9. The Daily Digest
+## 8. The Daily Digest
 
 **File:** [`src/workflows/digest_scheduler.py`](https://github.com/fambots/famworker/blob/main/src/workflows/digest_scheduler.py)
 
