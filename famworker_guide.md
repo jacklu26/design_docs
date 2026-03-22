@@ -400,40 +400,139 @@ Teaser content is pre-computed during Genesis:
 
 ---
 
-## 10. famgraph.json — The Central Configuration
+## 9. Deep Dive: famgraph.json
 
-**File:** [`fambot/src/memory/famgraph.json`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/famgraph.json) (~9000 lines)
+**File:** `fambot/src/memory/famgraph.json` (~9000 lines)
 
-This is the single most important file in the repo. It defines three things:
+This is the single most important file in the repo. Everything else — the workflows, the API, the database — is driven by what's in this file. Think of it as the **declarative specification** for the entire system.
 
-### Section 1: `logging_config` (lines 2-84)
+### Top-Level Structure
 
-Observability settings:
+The file is one big JSON object with three top-level keys:
 
-- Which event streams to log (LLM calls, activity executions, workflows)
-- ClickHouse buffer configuration (batch size, flush interval, retry policy)
-- LLM pricing tables (cost per million tokens for each model)
+```json
+{
+    "logging_config": { ... },   // Lines 2-84      — Observability and pricing
+    "graph": { ... },            // Lines 86-3707    — The node tree (data model + pipelines)
+    "schema": { ... }            // Lines 3708-8919  — Database table definitions
+}
+```
 
-### Section 2: `graph` (lines 86-3707)
+### Section 1: `logging_config`
 
-The node tree — defines every data category, how data flows between them, and the policies that drive processing. This is what `famspec_activity` reads to build pathways for Genesis.
+Controls observability and cost tracking:
 
-### Section 3: `schema` (lines 3708-8919)
+- **streams** — Which event types to log: `llm_calls`, `activity_executions`, `data_sets`, `function_executions`, `workflow_executions`. Each has an `enabled` flag and `sample_rate`.
+- **clickhouse** — Connection timeouts for the analytics database.
+- **write** — Buffer settings for log writes: `mode` (async), `buffer_max` (10000), `max_batch` (500), `flush_interval_ms` (250), `drop_policy` ("drop" if buffer is full).
+- **pricing** — LLM cost tables per provider/model. For example, Gemini 2.5 Flash costs $0.30 per million input tokens and $2.50 per million output tokens. This is used by the observability layer to calculate `cost_in_dollars` for every LLM call.
 
-Database table definitions — column types, constraints, inheritance, indexes. This is what `sync_spec_to_db.py` reads to generate `generated_schema.py` (the SQLAlchemy ORM).
+### Section 2: `graph`
+
+This defines the node tree — every data category, how they relate to each other, and the policies that drive data processing. This section is what `famspec_activity` reads when Genesis starts. It's covered in detail in the next section.
+
+### Section 3: `schema`
+
+Defines ~92 database tables. Contains:
+
+- **widgets** — UI rendering hints (e.g. `textarea`, `render_google_oauth`)
+- **enums** — Enumerated types (e.g. `gender`, `grade`, `caregiver_role`)
+- **custom_types** — Complex types like `FieldFilter` (regex-based filtering)
+- **bases** — Four base schemas that other entities inherit from (`system_base`, `gist_base`, `entity_base`, `belief`)
+- **entities** — The actual table definitions (e.g. `action`, `email`, `event`, `subscriber`, etc.)
+
+This section is covered in detail in section 12 (The Schema).
+
+### How famgraph.json Gets Used
+
+famgraph.json is consumed in several ways:
+
+| Consumer | What It Reads | Purpose |
+|----------|---------------|---------|
+| `GraphEngine.__init__()` | `graph` + `schema` | Builds the runtime graph, resolves filters/sorters, serves data via API |
+| `famspec_activity()` | `graph` (policies) | Builds Pathways for Genesis/Paging workflows |
+| `sync_spec_to_db.py` | `schema` | Generates `generated_schema.py` (SQLAlchemy ORM) |
+| `PricingTable` | `logging_config.pricing` | Calculates LLM cost per call |
+| `ActivityMetadataLoader` | `activity_metadata` | Routes activities to Temporal task queues |
+| Tests | `graph` + `schema` | Validates graph topology and entity relationships |
+
+famgraph.json can also be stored **per-user** in the database (in the `famgraph` + `famgraph_uid` tables). This allows different users to have customized graphs. When `GraphEngine` starts, it first checks the DB for a user-specific famgraph; if none is found, it falls back to the default file on disk.
 
 ---
 
-## 11. Nodes: The Building Blocks
+## 10. The Graph: Root, Nodes, and Paths
 
-A **node** is a location in the graph hierarchy. Each node typically maps to a database table.
+### What Is "root"?
 
-### Example: The `events` node
+You'll see paths like `root.emails`, `root.family.children`, `root.feed_v2` everywhere. Where does "root" come from?
+
+**"root" is NOT in the JSON file.** The `graph` section of famgraph.json looks like this:
+
+```json
+{
+    "graph": {
+        "profiles": { ... },
+        "events": { ... },
+        "emails": { ... },
+        "family": {
+            "children": { "entity": "child" },
+            "adults": { "entity": "adult" }
+        },
+        "actions": { ... },
+        "feed_v2": { ... }
+    }
+}
+```
+
+There's no `"root"` key. Instead, "root" is created **at parse time** by the `Node` class. When the `Graph` object is constructed from this JSON, it:
+
+1. Creates a root `Node` with `uid = "root"` (because it has no parent)
+2. For each key under `graph` (e.g. `"events"`, `"family"`), creates a child node with `uid = "root." + key`
+3. For nested keys (e.g. `"children"` under `"family"`), creates grandchild nodes with `uid = "root.family.children"`
+
+The rule is simple: **path = parent_path + "." + key_name**, starting from "root".
+
+### How Paths Are Built
+
+Here's the code logic (from `fambot/src/memory/models.py`):
+
+```
+If no parent exists → node_id = "root"
+If parent exists    → node_id = parent_uid + "." + name
+```
+
+So for this JSON structure:
+
+```json
+"graph": {
+    "family": {
+        "children": { "entity": "child" },
+        "caregivers": { "entity": "caregiver" }
+    },
+    "emails": { "entity": "email" }
+}
+```
+
+The parser produces:
+
+```
+"root"                  ← the implicit root node
+"root.family"           ← from key "family" under root
+"root.family.children"  ← from key "children" under "family"
+"root.family.caregivers"← from key "caregivers" under "family"
+"root.emails"           ← from key "emails" under root
+```
+
+All nodes are registered in `graph.all_nodes`, a flat dictionary mapping path strings to `Node` objects. This is how `GraphEngine.get_node("root.family.children")` works — it's a direct lookup.
+
+### Anatomy of a Node
+
+A **node** is a location in the graph hierarchy. Here's what a node can contain:
 
 ```json
 "events": {
     "entity": "event",
-    "description": "Events map one-to-one with what's happening in someone's life.",
+    "description": "Events from calendar accounts.",
     "policies": [
         {
             "name": "Event Policy",
@@ -444,54 +543,103 @@ A **node** is a location in the graph hierarchy. Each node typically maps to a d
                 "fields": ["name", "description", "starts_at", "ends_at", "location"]
             }
         }
-    ]
+    ],
+    "filters": [...],
+    "sorters": [...],
+    "limit": 100
 }
 ```
 
-This tells the system:
-- This node stores `event` records in the `event` database table
-- It has one policy that pulls data from `external` (Google Calendar API)
-- The policy uses `calendar_activity` as its processing activity
-- It extracts these five fields
+| Field | Purpose |
+|-------|---------|
+| `entity` | The database table this node maps to (e.g. `"event"` → the `event` table) |
+| `description` | Human-readable description of what this node stores |
+| `policies` | Processing pipelines that feed data into this node (see section 11) |
+| `filters` | Default WHERE clause filters applied when querying this node |
+| `sorters` | Default ORDER BY when querying this node |
+| `limit` | Max rows to return |
+| `paths` | (View nodes only) References to other nodes, with optional filter overrides |
+| `external_entity` | (External nodes only) E.g. `"google_calendar"` — queries a live API |
 
 ### Types of Nodes
 
-| Type | Examples | Characteristics |
-|------|----------|-----------------|
-| **Entity nodes** | `root.emails`, `root.actions`, `root.events` | Have an `entity` and `policies`; store data in Postgres |
-| **View nodes** | `feed_v2`, `newsletters` | Composed views with sub-paths, filters, and sorters; aggregate data from other nodes for the frontend |
-| **Profile nodes** | `root.profiles.school`, `root.profiles.activity` | Define family member profile schemas (identity, schedule, gear, etc.) |
-| **External nodes** | `root.google_events` | Query live APIs instead of Postgres |
+**Entity nodes** — The most common type. They have an `entity` (database table) and optionally `policies` (processing pipelines). Examples: `root.emails`, `root.actions`, `root.events`.
+
+**View nodes** — Aggregation nodes for the frontend. They don't store data themselves but reference other nodes via a `paths` dictionary. For example, `root.feed_v2` is a view that pulls in data from `root.actions`, `root.family_events`, `root.backpack_items`, `root.insights`, `root.events`, etc. — each with its own filters and sorters:
+
+```json
+"feed_v2": {
+    "paths": {
+        "root.actions": {
+            "filters": [{"final": true}, {"deadline": {">=": "CURRENT_DATE"}}]
+        },
+        "root.backpack_items": {
+            "filters": [{"final": true}]
+        },
+        "root.events": {
+            "filters": [...]
+        }
+    }
+}
+```
+
+When the API serves `GET /fam/root.feed_v2`, it deep-copies each referenced node, applies the filter overrides, queries Postgres for each, and returns the combined result.
+
+**Profile nodes** — Under `root.profiles`, these define schemas for family member information (school identity, schedules, gear, etc.).
+
+**External nodes** — Like `root.google_events`, which has `"external_entity": "google_calendar"`. These query a live API instead of Postgres.
 
 ### Node Catalog (major nodes)
 
 ```
-root.emails                → Raw emails from Gmail
-root.family_emails         → Family-relevant emails (filtered by LLM)
-root.email_summaries       → Newsletter summaries
-root.events                → Raw calendar events
-root.family_events         → Enriched family events
-root.actions               → Action items with due dates
-root.contacts              → People's contact info
-root.insights              → "Good to Know" information
-root.backpack_items        → Daily backpack checklists
-root.family_activities     → Ongoing activities (sports, clubs)
-root.actor_roles           → Who does what in activities
-root.fam_profiles          → Profile facts with composition
-root.subscribers           → Users
-root.family.children       → Children in the family
-root.family.adults         → Adults in the family
-root.calendars             → Calendar preferences
-root.chat_threads          → Chat conversation threads
-root.chat_messages         → Chat messages
-root.weather               → Weather data
-root.notification_settings → User notification preferences
-root.digest_teasers        → Pre-computed digest content
+Ingestion:
+  root.emails                → Raw emails from Gmail
+  root.events                → Raw calendar events from Google Calendar
+  root.google_events         → Live Google Calendar API (external)
+
+Processing (LLM extraction):
+  root.family_emails         → Family-relevant emails (filtered by LLM)
+  root.email_summaries       → Newsletter summaries
+  root.proto_events          → Candidate events extracted from emails
+  root.proto_actions         → Candidate action items from emails
+  root.proto_contacts        → Candidate contacts from emails
+  root.proto_insights        → Candidate "good to know" items
+  root.proto_backpack_items  → Candidate backpack checklist items
+
+Final entities (user-facing):
+  root.family_events         → Key Dates to Add
+  root.actions               → Actions to Take / On the Horizon
+  root.contacts              → Key Contacts
+  root.insights              → Good to Know
+  root.backpack_items        → Daily Backpack Check
+
+Family data:
+  root.family.children       → Children in the family
+  root.family.adults         → Adults
+  root.family.caregivers     → Caregivers
+  root.family.pets           → Pets
+  root.family_activities     → Ongoing activities (sports, clubs)
+  root.actor_roles           → Who does what in each activity
+  root.fam_profiles          → Profile facts
+
+System:
+  root.subscribers           → Users
+  root.accounts.google       → Google OAuth integrations
+  root.calendars             → Calendar preferences
+  root.notification_settings → Notification preferences
+  root.chat_threads          → Chat conversations
+  root.chat_messages         → Chat messages
+  root.weather               → Weather data
+  root.digest_teasers        → Pre-computed digest content
+
+Views (frontend aggregations):
+  root.feed_v2               → Main feed (actions + events + insights + backpack + schedule)
+  root.newsletters           → Newsletter decoder view
 ```
 
 ---
 
-## 12. Policies and Pathways: How Data Flows Between Nodes
+## 11. Policies and Pathways: How Data Flows Between Nodes
 
 ### Policies
 
@@ -544,7 +692,7 @@ root.family_activities → agent_activity → root.actor_roles
 
 ---
 
-## 13. The Schema: Database Table Definitions
+## 12. The Schema: Database Table Definitions
 
 The `schema` section of [`famgraph.json`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/famgraph.json) defines ~92 database tables. Tables use **inheritance** from four base schemas:
 
@@ -605,7 +753,7 @@ PostgreSQL tables
 
 ---
 
-## 14. GraphEngine: Bridging Config to Live Data
+## 13. GraphEngine: Bridging Config to Live Data
 
 **File:** [`fambot/src/memory/injected_models.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/injected_models.py)
 
@@ -651,7 +799,7 @@ return render_path(graph, "root.feed_v2")
 
 ---
 
-## 15. The FastAPI Service and Chat
+## 14. The FastAPI Service and Chat
 
 **File:** [`fambot/src/fam/fam_service.py`](https://github.com/fambots/famworker/blob/main/fambot/src/fam/fam_service.py)
 
@@ -712,7 +860,7 @@ Both agents are LangGraph ReAct agents with different tool sets. They share the 
 
 ---
 
-## 16. Profiles: Family Member Data
+## 15. Profiles: Family Member Data
 
 **File:** [`fambot/src/memory/profile.py`](https://github.com/fambots/famworker/blob/main/fambot/src/memory/profile.py)
 
@@ -745,7 +893,7 @@ Profiles are used for:
 
 ---
 
-## 17. Storage: Postgres, Redis, ClickHouse
+## 16. Storage: Postgres, Redis, ClickHouse
 
 ### PostgreSQL (primary database)
 
@@ -771,7 +919,7 @@ Profiles are used for:
 
 ---
 
-## 18. Cost Tracking and Observability
+## 17. Cost Tracking and Observability
 
 ### How Costs Are Tracked
 
@@ -808,7 +956,7 @@ There is no per-node budget for the pipeline yet (this is what the Node Budget C
 
 ---
 
-## 19. Key File Reference
+## 18. Key File Reference
 
 ### Workflows and Activities
 
