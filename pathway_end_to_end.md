@@ -1,30 +1,124 @@
-# Pathway End-to-End: From famgraph.json to Postgres
+# How Famworker Actually Works: A Case Study
 
-A hands-on walkthrough tracing a single Pathway through the entire system, using `root.actions` as the concrete example. Read the [Famworker Guide](famworker_guide.md) first for foundational concepts.
-
----
-
-## The Chain We're Tracing
-
-```
-root.emails → root.family_emails → root.proto_actions → root.actions
-                                                            ↑
-                                                     (this is our target)
-```
-
-Each arrow is a separate Policy → Pathway → PagingWorkflow → LLM call. We'll follow `root.actions` (the final link), but the same mechanics apply to every link in the chain.
+Follow one user's journey from signup to seeing "Actions to Take" in their feed. Along the way, we'll meet every major abstraction in the system — not as definitions, but as the things that make this journey happen.
 
 ---
 
-## Step 1: The Policy in famgraph.json
+## Part 1: The Story — Sarah Signs Up
 
-Everything starts in `fambot/src/memory/famgraph.json`. The `actions` node (which becomes `root.actions` at runtime) is defined around line 885:
+Sarah is a parent with two kids. She signs up for Fambot, goes through onboarding, and connects her Gmail account. At this point, a row is created in the `integration` table:
+
+```
+uid: "sarah_123"    email: "sarah@gmail.com"    active: true    last_scan: NULL
+```
+
+That `last_scan: NULL` is the trigger for everything that follows. Sarah closes her browser and goes about her day. She has no idea what happens next — but within 10 minutes, her feed will show extracted action items from her school newsletters.
+
+Let's follow that journey.
+
+---
+
+## Part 2: How It Gets Triggered — The Production Mechanism
+
+Nothing in this system runs because of a user click. There is no "process my emails" button. Instead, a **scheduled loop** runs constantly in the background.
+
+### Chronos: The 60-Second Heartbeat
+
+A Temporal workflow called **Chronos** runs every 60 seconds. Every tick, it asks one question:
+
+> "Is there a user who needs processing?"
+
+The SQL looks roughly like:
+
+```sql
+SELECT uid FROM integration
+WHERE active AND last_scan IS NULL
+  AND uid NOT IN (SELECT uid FROM subscriber WHERE NOT connected)
+ORDER BY total_scans ASC, last_scan ASC NULLS FIRST
+LIMIT 1;
+```
+
+New users (`last_scan IS NULL`) always get priority. Sarah's row matches immediately on the next tick — within 60 seconds of connecting her Gmail.
+
+Chronos doesn't process Sarah's data itself. It starts a **Genesis** workflow for her:
+
+```python
+await workflow.execute_child_workflow(
+    GenesisWorkflow.run,
+    GenesisRequest(uid="sarah_123", ...),
+    ...
+)
+```
+
+**File:** `src/workflows/chronos.py`
+
+### Genesis: Sarah's Personal Orchestrator
+
+Genesis is a per-user workflow. Its job: figure out *what* processing needs to happen for Sarah, and *in what order*.
+
+But how does Genesis know what to do? It doesn't have hard-coded logic like "first fetch emails, then extract actions." Instead, it asks a configuration file.
+
+```python
+@workflow.run
+async def run(self, request: GenesisRequest) -> None:
+    flowgraph_params = await workflow.execute_activity(
+        famspec_activity,
+        FamspecParams(uid=request.uid),
+        ...
+    )
+    for phase_idx, phase_pathways in enumerate(flowgraph_params.pathways_by_phase):
+        await self._run_phase(request, phase_pathways)
+```
+
+That `famspec_activity` call is where the configuration system enters the picture.
+
+**File:** `src/workflows/genesis.py`
+
+---
+
+## Part 3: The Configuration — Where famgraph.json Comes In
+
+### What famspec_activity actually does
+
+```python
+@activity.defn()
+async def famspec_activity(famspec: FamspecParams) -> FlowgraphParams:
+    graph = await GraphEngine.create_async(famspec.uid)
+    pathways_by_phase = await graph.get_pathways_by_phases()
+    return FlowgraphParams(famspec.uid, pathways_by_phase)
+```
+
+It loads a file called `famgraph.json` — a ~9,000-line JSON file that is the **single source of truth** for the entire system. This file declares every data category, every processing pipeline, every database table, and how they all connect.
+
+**File:** `fambot/src/memory/famgraph.json`
+
+### Nodes: The data categories
+
+Inside `famgraph.json`, there's a `graph` section that defines **nodes** — named data categories organized in a tree. Each node has a dot-separated path:
+
+```
+root.emails              → Raw emails from Gmail
+root.family_emails       → Family-relevant emails (filtered by LLM)
+root.proto_actions       → Draft action items (extracted by LLM)
+root.actions             → Final action items (refined by LLM)
+root.events              → Calendar events from Google Calendar
+root.family_events       → Key dates extracted from emails
+root.insights            → "Good to Know" items
+root.backpack_items      → Daily backpack checklist
+```
+
+Each node maps to a Postgres table via its `entity` field. For example, `root.actions` has `"entity": "action"`, meaning it reads from and writes to the `action` table.
+
+### Policies: How data flows between nodes
+
+Nodes don't just store data — they declare *how* they get populated. Each node can have one or more **policies** that say: "To fill me, take data from *this* source, run *this* activity, and extract *these* fields."
+
+Here's the real policy on the `actions` node in famgraph.json:
 
 ```json
 "actions": {
     "entity": "action",
-    "description": "Pick out the real-world action that matters most from the events...",
-    "gist_prompt": "Describe what needs to happen in 4-8 words. Keep it simple.",
+    "description": "Pick out the real-world action that matters most...",
     "policies": [
         {
             "name": "Action Policy",
@@ -32,307 +126,298 @@ Everything starts in `fambot/src/memory/famgraph.json`. The `actions` node (whic
             "batch_size": 1,
             "data_query": "root.proto_actions",
             "merge_by_gist": true,
-            "derived_fields": [
-                { "derived_date": "inheritOrParse(start_time)" },
-                { "source_cb_map": "inherit(source_cb_map)" },
-                { "deadline": "fallback_chain(start_time, date_add(startline, 1, day))" }
-            ],
             "traits": {
                 "flows": ["agent_activity"],
                 "sources": ["root.proto_actions"],
-                "fields": ["name", "description", "cta", "start_time", "location", "startline", "deadline"]
+                "fields": ["name", "description", "cta", "start_time",
+                           "location", "startline", "deadline"]
             }
         }
     ]
 }
 ```
 
-### What each field means
+Reading this declaratively: "To populate `root.actions`, read from `root.proto_actions`, run `agent_activity`, and extract these 7 fields." No Python code tells the system to do this — it's all declared in JSON.
 
-| Field | Value | Purpose |
-|-------|-------|---------|
-| `entity` | `"action"` | Writes to the `action` Postgres table |
-| `traits.sources` | `["root.proto_actions"]` | Input comes from upstream proto_actions |
-| `traits.flows` | `["agent_activity"]` | Runs the LLM extraction activity |
-| `traits.fields` | 7 fields | What the LLM must extract from each input record |
-| `batch_size` | `1` | Process one proto_action at a time |
-| `merge_by_gist` | `true` | Deduplicate via gist embeddings across scans |
-| `data_query` | `"root.proto_actions"` | Where to query source data from Postgres |
-| `derived_fields` | fallback chains | Auto-computed fields (e.g. deadline falls back to start_time) |
+Every arrow in the processing chain is a policy:
 
-### The upstream chain
-
-The `root.actions` node doesn't exist in isolation. Here's how data flows to it:
-
-**root.family_emails** (line ~2229) — filters raw emails for family-relevant content:
-- `model: "google_genai/gemini-2.5-flash"`, `batch_size: 4`
-- Source: `root.emails`, extracts: `name, summary, salience, follow_links`
-
-**root.proto_actions** (line ~2046) — extracts draft action items from family emails:
-- `model: "google_genai/gemini-2.5-flash"`, `batch_size: 1`
-- Source: `root.family_emails`, extracts: `name`
-- Detailed description instructs the LLM on what counts as an action vs. noise
-
-**root.actions** (line ~885) — refines proto_actions into final, user-facing actions:
-- No explicit model (uses default), `batch_size: 1`
-- Source: `root.proto_actions`, extracts all 7 fields
-- `merge_by_gist: true` for cross-scan deduplication
-
----
-
-## Step 2: Policy Becomes a Pathway
-
-When Chronos triggers Genesis for a user, the first thing Genesis does is call `famspec_activity` (`src/activities/famspec.py`):
-
-```python
-@activity.defn()
-async def famspec_activity(famspec: FamspecParams) -> FlowgraphParams:
-    graph = await GraphEngine.create_async(famspec.uid)
-    await graph.engine.set_integrations_scan_to_now(famspec.uid)
-    pathways_by_phase = await graph.get_pathways_by_phases()
-    # ... optional target filtering ...
-    res = FlowgraphParams(famspec.uid, pathways_by_phase)
-    return res
+```
+root.emails                    root.family_emails              root.proto_actions           root.actions
+  policy: email_activity  →      policy: agent_activity   →     policy: agent_activity  →    policy: agent_activity
+  source: external               source: root.emails            source: root.family_emails   source: root.proto_actions
+  model: n/a (API call)          model: gemini-2.5-flash        model: gemini-2.5-flash      model: (default)
+  batch_size: n/a                batch_size: 4                  batch_size: 1                batch_size: 1
 ```
 
-### The conversion chain: traits → GroundFlow → Pathway
+### From Policy to Pathway
 
-Inside `get_pathways_by_phases()` (in `injected_models.py`), for each node:
+Policies are the static, config-time declaration. But Temporal workflows need a runtime object they can pass around, serialize, and act on. That runtime object is called a **Pathway**.
 
-**1. Policy validation resolves traits into GroundFlows.** When the `Policy` Pydantic model is constructed, it auto-resolves `traits` into `GroundFlow` objects via `resolve_ground_flows()`. Each GroundFlow is the core triple:
+When `famspec_activity` calls `graph.get_pathways_by_phases()`, here's what happens internally:
+
+1. **Traits resolve into GroundFlows.** Each policy has `traits` (flows, sources, fields). These get combined into `GroundFlow` objects — the core triple of *which activity* + *which source* + *which fields*:
 
 ```python
 class GroundFlow(BaseModel):
-    flow: Flow           # which activity to run (e.g. agent_activity)
-    source: NodeQuery    # which node to read from (e.g. root.proto_actions)
-    fields: list[str]    # what fields to extract
-    prompt: Prompt       # prompt template (from node description)
-    targets: list[str]   # downstream nodes to signal
+    flow: Flow           # e.g. agent_activity
+    source: NodeQuery    # e.g. root.proto_actions
+    fields: list[str]    # e.g. [name, description, cta, ...]
 ```
 
-For our Action Policy, there's one GroundFlow: `flow=agent_activity`, `source=root.proto_actions`, `fields=[name, description, cta, ...]`.
+2. **Each GroundFlow becomes a Pathway.** The function `ground_flow_to_pathway()` takes the GroundFlow plus all the policy-level config (batch_size, model, derived_fields, merge_by_gist, etc.) and creates a `Pathway` — a flat dataclass with ~80 fields carrying *everything* needed for execution.
 
-**2. Each GroundFlow becomes a Pathway.** The function `ground_flow_to_pathway()` (policy.py, line ~1605) takes the GroundFlow plus all policy-level config and creates a `Pathway` — a flat dataclass with ~80 fields carrying everything PagingWorkflow needs:
+3. **Pathways are grouped by phase.** Phase 0 = external sources (Gmail, Calendar). Phase 1+ = internal processing, ordered by data dependencies.
 
-```python
-def ground_flow_to_pathway(id, name, gf, batch_size, model, ...) -> Pathway:
-    return Pathway(
-        id=id,
-        name=name,
-        workflow=flow_to_workflow(gf.flow),   # maps "agent_activity" → workflow config
-        fields=gf.fields,
-        source=gf.source.path,
-        node_path=node_path,                  # "root.actions"
-        data_query=data_query,                # "root.proto_actions"
-        model=model,
-        batch_size=batch_size,
-        merge_by_gist=merge_by_gist,
-        # ... ~70 more fields ...
-    )
+For Sarah's scan, `famspec_activity` returns something like:
+
+```
+Phase 0 (parallel):
+  - Pathway: root.emails       (source: external, flow: email_activity)
+  - Pathway: root.events       (source: external, flow: calendar_activity)
+
+Phase 1 (sequential):
+  - Pathway: root.family_emails      (source: root.emails, flow: agent_activity)
+  - Pathway: root.proto_actions      (source: root.family_emails, flow: agent_activity)
+  - Pathway: root.actions            (source: root.proto_actions, flow: agent_activity)
+  - Pathway: root.proto_events       (source: root.email_summaries, flow: agent_activity)
+  - Pathway: root.family_events      (source: root.proto_events, flow: agent_activity)
+  - ... ~15 more pathways
 ```
 
-**3. Pathways are grouped by phase.** `get_pathways_by_phases()` buckets pathways by their `phase` field. Phase 0 is external sources (Gmail, Calendar), Phase 1+ is internal processing in dependency order.
+**Files:** `fambot/src/memory/policy.py` (Policy, GroundFlow, Pathway), `src/activities/famspec.py`
 
 ---
 
-## Step 3: Genesis Orchestrates the Phases
+## Part 4: Execution — PagingWorkflow Does the Work
 
-Genesis (`src/workflows/genesis.py`) processes phases sequentially:
+Genesis now has a list of Pathways grouped by phase. It starts one **PagingWorkflow** per Pathway.
+
+### How Genesis orchestrates
 
 ```python
-@workflow.run
-async def run(self, request: GenesisRequest) -> None:
-    flowgraph_params = await workflow.execute_activity(famspec_activity, ...)
+async def _run_phase(self, request, phase_pathways):
+    for pathway in phase_pathways:
+        if pathway.source in ["external", "on_start"]:
+            # Start in parallel — don't wait
+            external_workflows.append(
+                workflow.start_child_workflow(PagingWorkflow.run, ...)
+            )
+        else:
+            # Start sequentially — wait for "ready" signal before starting the next
+            child = workflow.start_child_workflow(PagingWorkflow.run, ...)
+            await child
+            await workflow.wait_condition(lambda: self._child_workflows_ready[wf_id])
 
-    for phase_idx, phase_pathways in enumerate(flowgraph_params.pathways_by_phase):
-        selected_pathways = select_phase_pathways(phase_pathways, genesis_failed)
-        await self._run_phase(request, selected_pathways)
+    await asyncio.gather(*external_workflows)
+    await workflow.wait_condition(lambda: all_complete())
 ```
 
-In `_run_phase`, the key distinction:
+Phase 0 runs Gmail and Calendar fetches in parallel. Phase 1+ runs internal pathways one at a time, because each depends on the previous one's output.
 
-- **External pathways** (source = `"external"` or `"on_start"`) — started **in parallel** via `asyncio.gather`
-- **Internal pathways** (like `root.actions`) — started **sequentially**, each one signals "ready" before the next starts
+### What PagingWorkflow does (for root.actions)
 
-```python
-if pathway.source == "external" or pathway.source == "on_start":
-    child_workflow = workflow.start_child_workflow(PagingWorkflow.run, ...)
-    external_workflows.append(child_workflow)
-else:
-    child_workflow = workflow.start_child_workflow(PagingWorkflow.run, ...)
-    await child_workflow
-    # Wait for this workflow to signal it's ready before starting the next
-    await workflow.wait_condition(
-        lambda wf=wf_id: self._child_workflows_ready[wf],
-        timeout=timedelta(seconds=3600),
-    )
-```
+Each PagingWorkflow receives exactly one Pathway. For `root.actions`:
 
-Genesis tracks each child workflow in `_child_workflows_complete` and waits for all to signal `workflow_complete` before moving to the next phase.
+**1. Signal "ready" to Genesis** — so Genesis can start the next PagingWorkflow in sequence.
 
----
+**2. Wait for upstream data** — the `root.proto_actions` PagingWorkflow sends a signal with a Redis key pointing to the proto_action records it produced.
 
-## Step 4: PagingWorkflow Executes the Pathway
+**3. Partition** — `partition_activity` splits the data by `partition_keys` (here: `["uid"]`) into batches sized according to `batch_size`.
 
-Each PagingWorkflow (`src/workflows/paging.py`) receives exactly one Pathway. For internal sources like `root.actions`:
-
-### a) Signal Genesis "ready" and send empty init batch
+**4. Call the agent** — this is the LLM call. PagingWorkflow dynamically invokes whatever activity is named in the Pathway:
 
 ```python
-if request.pathway.source not in ["external", "on_start"]:
-    self.signal_activity = request.pathway.workflow.name  # "agent_activity"
-    if self.genesis_wf_id is not None:
-        await self._signal_with_retry(self.genesis_wf_id, "child_ready", ...)
-    await self.signal_response_to_targets({}, init_request, send_empty=True)
-```
-
-### b) Wait for upstream data
-
-PagingWorkflow waits for signals from `root.proto_actions`'s PagingWorkflow, which passes Redis keys pointing to the source data.
-
-### c) Partition the data
-
-`partition_activity` splits incoming data by `partition_keys` (here: `["uid"]`):
-
-```python
-partitioned_data = await workflow.execute_activity(
-    partition_activity, partition_params,
-    task_queue="activity-task-queue", ...
+self.signal_activity = request.pathway.workflow.name  # "agent_activity"
+# ...
+response = await workflow.execute_activity(
+    self.signal_activity,  # dynamically resolved from famgraph.json
+    request,
+    task_queue=self.pathway.signal_activity_task_queue,
+    ...
 )
 ```
 
-### d) Call the agent (LLM extraction)
+The activity name isn't hard-coded — it comes from the policy's `traits.flows` in famgraph.json. This is how the JSON config declaratively controls runtime behavior.
 
-For each partition, `call_activity` → `exec_signal_activity` dynamically invokes the activity named in the pathway:
-
-```python
-async def exec_signal_activity(self, request, ...):
-    response = await workflow.execute_activity(
-        self.signal_activity,  # "agent_activity" (from pathway.workflow.name)
-        request,
-        task_queue=self.pathway.signal_activity_task_queue,
-        start_to_close_timeout=timedelta(seconds=720),
-        ...
-    )
-```
-
-Note: `self.signal_activity` is a **string** — the activity name from the pathway config. This is how famgraph.json declaratively controls which activity runs for each node.
-
-### e) Signal Genesis "complete"
-
-```python
-async def signal_workflow_end_to_genesis(self):
-    wf_completion_request = WorkflowCompleteRequest(
-        workflow_id=wf_id, status="Completed"
-    )
-    await self._signal_with_retry(
-        self.genesis_wf_id, "workflow_complete", wf_completion_request
-    )
-```
-
----
-
-## Step 5: agent_activity — The LLM Call
-
-`agent_activity` (`src/activities/agent.py`) is the Temporal activity that runs the LLM:
+**5. agent_activity runs the LLM:**
 
 ```python
 @activity.defn
 async def agent_activity(request: TargetRequest) -> AgentActivityResponse:
     graph = await GraphEngine.create_async(request.pathway.uid)
-    ctx_settings = await graph.get_contextual_settings()
-    request.pathway.activity_instance_id = uuid.uuid4().hex
     response = await run_agent_activity(request)
-    # Cleanup heavy fields to save Temporal payload size
-    response.pathway.category_contexts = None
-    response.pathway.source_content = None
-    response.pathway.prompt = og_prompt
     return response
 ```
 
-The heavy lifting is in `run_agent_activity` (from `fam.fam_tools.agent_tool_utils`), which:
+Inside `run_agent_activity`:
+- Builds a prompt from the pathway's `description`, `fields`, source data, and family context
+- Calls the LLM (model specified in the pathway, e.g. gemini-2.5-flash)
+- Uses tool-calling (`InsertNodeEntity`) to get structured output
+- Returns extracted records matching the 7 fields: `name`, `description`, `cta`, `start_time`, `location`, `startline`, `deadline`
 
-1. **Builds a prompt** from the pathway's `description`, `fields`, `gist_prompt`, and source data
-2. **Calls the LLM** using the model from the pathway (or default)
-3. **Uses tool-calling** (typically the `InsertNodeEntity` tool) to get structured output matching the field list
-4. **Returns extracted records** as an `AgentActivityResponse`
+**6. Write to Postgres** — the extracted action records are written to the `action` table with metadata like `node_path="root.actions"`, `policy_name="Action Policy"`, and `scan_sequence_number`.
 
-For `root.actions`, the LLM receives proto_action records and must extract: `name`, `description`, `cta`, `start_time`, `location`, `startline`, `deadline`.
+**7. Deduplication** — because `merge_by_gist: true`, the system computes a gist embedding for each record and checks for similar existing records before inserting. This prevents "Sign permission slip by Friday" from appearing twice across scans.
 
----
+**8. Signal Genesis "complete":**
 
-## Step 6: Results Land in Postgres
-
-Extracted records are written to the `action` table (the `entity` from the node definition). Every record inherits columns from `system_base`:
-
-| Column | Value | Source |
-|--------|-------|--------|
-| `node_path` | `"root.actions"` | From the pathway |
-| `policy_name` | `"Action Policy"` | From the pathway |
-| `pathway_id` | UUID | From the pathway |
-| `scan_sequence_number` | Integer | Which scan cycle created this |
-| `final` | Boolean | Whether this record is finalized |
-| `git_commit` | String | Code version that created this |
-| `created_at` / `updated_at` | Timestamps | Auto-set |
-
-Because `merge_by_gist: true`, the system also:
-1. Computes a gist embedding for the new record
-2. Searches for existing records with similar gists (above `gist_threshold: 0.80`)
-3. If a match is found, merges instead of inserting a duplicate
-
-### derived_fields resolution
-
-Before writing, derived fields are resolved. For example:
-- `"deadline": "fallback_chain(start_time, date_add(startline, 1, day))"` — if the LLM didn't extract a deadline, compute it from start_time, or from startline + 1 day
-- `"source_cb_map": "inherit(source_cb_map)"` — carry forward the source callback map from the upstream proto_action
-
----
-
-## The Complete Picture
-
-```
-famgraph.json
-  └─ "actions" node with "Action Policy"
-       │
-       ▼  famspec_activity (Temporal activity)
-  Policy.traits → GroundFlow → ground_flow_to_pathway() → Pathway
-       │
-       ▼  Genesis groups by phase, starts child workflow
-  PagingWorkflow receives Pathway
-       │
-       ├─ signals Genesis "ready"
-       ├─ waits for upstream signal (from root.proto_actions PagingWorkflow)
-       ├─ partition_activity() splits data by uid
-       ├─ agent_activity() → run_agent_activity() → LLM call
-       │    └─ extracts: name, description, cta, start_time, location, startline, deadline
-       │    └─ uses InsertNodeEntity tool for structured output
-       ├─ derived_fields resolved (deadline fallback, source_cb_map inheritance)
-       ├─ merge_by_gist deduplication check
-       ├─ results written to `action` table in Postgres
-       ├─ signals downstream targets (if any)
-       └─ signals Genesis "workflow_complete"
+```python
+await self._signal_with_retry(
+    self.genesis_wf_id, "workflow_complete",
+    WorkflowCompleteRequest(workflow_id=wf_id, status="Completed")
+)
 ```
 
----
+Genesis marks this PagingWorkflow as done and, once all pathways in the phase complete, moves to the next phase.
 
-## Key Files Referenced
-
-| File | Role in this flow |
-|------|-------------------|
-| `fambot/src/memory/famgraph.json` | Source of truth — node + policy definitions |
-| `fambot/src/memory/policy.py` | Policy, GroundFlow, Pathway classes; `ground_flow_to_pathway()` |
-| `fambot/src/memory/injected_models.py` | GraphEngine; `get_pathways()`, `get_pathways_by_phases()` |
-| `src/activities/famspec.py` | `famspec_activity` — loads graph, builds pathways |
-| `src/workflows/genesis.py` | GenesisWorkflow — orchestrates phases, starts PagingWorkflows |
-| `src/workflows/paging.py` | PagingWorkflow — partitions, calls agent, signals completion |
-| `src/activities/agent.py` | `agent_activity` — runs the LLM extraction |
-| `src/activities/partition.py` | `partition_activity` — splits data into batches |
+**Files:** `src/workflows/paging.py`, `src/activities/agent.py`, `src/activities/partition.py`
 
 ---
 
-## What to Explore Next
+## Part 5: GraphEngine — The Runtime Bridge
 
-- **How prompts are built:** Trace `run_agent_activity` in `fambot/src/fam/fam_tools/agent_tool_utils.py` to see how the node description, fields, and source data become an LLM prompt.
-- **Gist deduplication:** Look at `merge_by_gist` handling in the agent tool chain to understand how vector similarity prevents duplicate actions across scans.
-- **derived_fields expressions:** Functions like `fallback_chain()`, `inherit()`, `date_add()` are resolved at write time — find their implementations to understand the mini-expression language.
-- **A different pathway type:** Trace `root.emails` (external source via Gmail API) or `root.family_events` (has `categories` and more complex extraction) for contrast.
+You've seen `GraphEngine` appear several times:
+
+- In `famspec_activity`: `graph = await GraphEngine.create_async(uid)` → builds Pathways
+- In `agent_activity`: `graph = await GraphEngine.create_async(uid)` → provides context
+- In the API: `graph = GraphEngine(uid=uid)` → serves data to the frontend
+
+GraphEngine is the **runtime class that brings famgraph.json to life**. It:
+
+1. **Loads the spec** — tries the DB first (users can have customized graphs), falls back to the JSON file on disk
+2. **Parses the graph** — builds `Node` and `Entity` objects from the `graph` section
+3. **Parses the schema** — resolves table definitions and base inheritance from the `schema` section
+4. **Exposes methods** for different consumers:
+
+| Method | Used by | Purpose |
+|--------|---------|---------|
+| `get_pathways()` | Temporal workers | Build Pathway objects from all active policies |
+| `get_pathways_by_phases()` | Genesis via famspec_activity | Pathways grouped by execution phase |
+| `get_node(path)` | API, workers | Look up a specific node by path |
+| `get_path_data(path)` | API | Query Postgres with the node's filters and sorters |
+| `render_path(path)` | API | Render a full view (resolving view nodes into combined data) |
+
+GraphEngine uses LRU caches (50 instances by uid, 200 query results) so the 9,000-line JSON isn't re-parsed on every request.
+
+**File:** `fambot/src/memory/injected_models.py`
+
+---
+
+## Part 6: Sarah Sees Her Data
+
+After Genesis completes all phases (~2–10 minutes), Sarah's data is in Postgres. When she opens the app, the frontend calls:
+
+```
+GET /fam/root.feed_v2
+```
+
+The FastAPI service creates a GraphEngine for Sarah's uid, looks up the `root.feed_v2` node, and discovers it's a **view node** — it doesn't store data itself but references other nodes:
+
+```json
+"feed_v2": {
+    "paths": {
+        "root.actions":        { "filters": [{"final": true}, {"deadline": {">=": "CURRENT_DATE"}}] },
+        "root.family_events":  { "filters": [{"final": true}] },
+        "root.backpack_items": { "filters": [{"final": true}] },
+        "root.insights":       { "filters": [{"final": true}] },
+        "root.events":         { "filters": [...] }
+    }
+}
+```
+
+GraphEngine queries each referenced node from Postgres (with the filter overrides), and returns the combined result. Sarah sees:
+
+- **Actions to Take** — "Sign permission slip by Friday", "Pay field trip fee by March 28"
+- **Key Dates** — "Spring Concert, April 15 at 6pm"
+- **Good to Know** — "New dismissal procedure starts Monday"
+- **Backpack Check** — "Soccer cleats, water bottle, signed form"
+
+All of this was extracted from her Gmail by the pipeline we just traced.
+
+---
+
+## Putting It All Together
+
+Here's the complete flow, from signup to screen:
+
+```
+Sarah connects Gmail
+  │
+  ▼  (integration row: last_scan=NULL)
+Chronos (every 60s) picks Sarah
+  │
+  ▼
+Genesis starts for sarah_123
+  │
+  ├─ famspec_activity loads famgraph.json via GraphEngine
+  │    └─ Parses nodes, policies → GroundFlows → Pathways
+  │    └─ Groups ~20 Pathways into phases
+  │
+  ├─ Phase 0 (parallel):
+  │    ├─ PagingWorkflow(root.emails)  → Gmail API → raw emails to Postgres
+  │    └─ PagingWorkflow(root.events)  → Calendar API → events to Postgres
+  │
+  ├─ Phase 1 (sequential, each waits for upstream):
+  │    ├─ PagingWorkflow(root.family_emails)    → LLM filters for family emails
+  │    ├─ PagingWorkflow(root.proto_actions)    → LLM extracts draft actions
+  │    ├─ PagingWorkflow(root.actions)          → LLM refines into final actions
+  │    ├─ PagingWorkflow(root.proto_events)     → LLM extracts draft events
+  │    ├─ PagingWorkflow(root.family_events)    → LLM refines into final events
+  │    └─ ... more pathways for insights, contacts, backpack items
+  │
+  └─ All phases complete → last_scan updated
+       │
+       ▼
+Sarah opens the app
+  │
+  ▼  GET /fam/root.feed_v2
+GraphEngine resolves the view node
+  │
+  ├─ Queries root.actions      → "Sign permission slip by Friday"
+  ├─ Queries root.family_events → "Spring Concert, April 15"
+  ├─ Queries root.insights      → "New dismissal procedure"
+  └─ Queries root.backpack_items → "Soccer cleats, water bottle"
+       │
+       ▼
+Sarah sees her personalized family feed
+```
+
+---
+
+## Concept Index
+
+Every abstraction we met, in the order it appeared:
+
+| Concept | What it is | Where we met it |
+|---------|-----------|-----------------|
+| **Chronos** | Temporal workflow that runs every 60s, picks the next user to process | Part 2 |
+| **Genesis** | Per-user Temporal workflow that orchestrates all processing | Part 2 |
+| **famgraph.json** | ~9,000-line JSON file declaring all nodes, policies, and schema | Part 3 |
+| **Node** | Named data category in a tree (e.g. `root.actions` → `action` table) | Part 3 |
+| **Policy** | Declarative rule on a node: source → activity → fields | Part 3 |
+| **GroundFlow** | Core triple: which activity + which source + which fields | Part 3 |
+| **Pathway** | Runtime dataclass (~80 fields) carrying everything for execution | Part 3 |
+| **PagingWorkflow** | Temporal workflow that executes one Pathway | Part 4 |
+| **agent_activity** | Temporal activity that calls the LLM for extraction | Part 4 |
+| **partition_activity** | Temporal activity that splits data into batches | Part 4 |
+| **Gist / merge_by_gist** | Semantic embedding for deduplication across scans | Part 4 |
+| **GraphEngine** | Runtime class that loads famgraph.json and serves data | Part 5 |
+| **View Node** | Aggregation node (like `root.feed_v2`) that combines other nodes | Part 6 |
+
+---
+
+## Key Files
+
+| File | What it does |
+|------|-------------|
+| `fambot/src/memory/famgraph.json` | The source of truth — nodes, policies, schema |
+| `fambot/src/memory/policy.py` | Policy, GroundFlow, Pathway classes |
+| `fambot/src/memory/injected_models.py` | GraphEngine — loads config, builds pathways, serves data |
+| `fambot/src/memory/models.py` | Node, Entity, Graph classes |
+| `src/workflows/chronos.py` | Scheduler — picks users every 60s |
+| `src/workflows/genesis.py` | Per-user orchestrator — runs pathways in phases |
+| `src/workflows/paging.py` | Data processor — one per pathway |
+| `src/activities/famspec.py` | Loads GraphEngine, converts policies to pathways |
+| `src/activities/agent.py` | Runs the LLM extraction |
+| `src/activities/partition.py` | Splits data into batches |
+| `fambot/src/fam/fam_service.py` | FastAPI — serves `GET /fam/{path}` to the frontend |
